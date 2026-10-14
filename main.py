@@ -2,8 +2,8 @@
 
 Uses the existing three repository secrets and requirements.txt. No runtime tuning:
 15-second pauses remain. New/changed sources are saved as immutable extraction
-snapshots in tournaments; identical content reuses a snapshot. Different documents
-about one tournament are NOT merged yet. Existing processed_files markers from v1
+snapshots in tournaments; identical content reuses a snapshot. Derived tournament
+grouping is maintained separately in canonical_tournaments with source references. Existing processed_files markers from v1
 are preserved and skipped. There is no WhatsApp collector in this file.
 """
 import base64
@@ -15,6 +15,8 @@ import os
 import re
 import time
 import uuid
+import unicodedata
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import firebase_admin
@@ -365,6 +367,7 @@ def process_files(session, store, folder, api_key):
                 # API, transport and database errors stop the run without retries.
                 if not isinstance(exc, ValueError):
                     break
+        refresh_canonical_tournaments(store)
     finally:
         try:
             store.release()
@@ -373,6 +376,276 @@ def process_files(session, store, folder, api_key):
     if stats["errors"]:
         raise RuntimeError("Collector failed; inspect the preceding safe error message")
     return stats
+
+
+# Tournament grouping: derived records only. Never edit/delete source extractions.
+GROUPING_VERSION = 1
+MAX_GROUPING_RECORDS = 2000
+MAX_GROUPING_WRITES = 400
+CANONICAL_COLLECTION = "canonical_tournaments"
+
+
+def norm_text(value):
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    text = re.sub(r"['’]s\b", "", text)
+    return " ".join(re.findall(r"[a-z0-9]+", text))
+
+
+def title_keys(data):
+    generic = {"the", "by", "of", "and", "in", "a", "an", "presents"}
+    values = [data.get("tournament_name")] + (data.get("other_titles") or [])
+    keys = []
+    for value in values:
+        words = frozenset(w for w in norm_text(value).split()
+                          if w not in generic and not re.fullmatch(r"20\d\d", w))
+        if len(words) >= 2:
+            keys.append(words)
+    return keys
+
+
+def titles_match(left, right):
+    # Subset matches allow an edition subtitle or organiser to accompany a title.
+    bland = {"pickleball", "badminton", "padel", "tennis", "tournament", "tour",
+             "open", "championship", "championships", "sports", "racket"}
+    for a in title_keys(left):
+        for b in title_keys(right):
+            shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+            if shorter <= longer and shorter - bland:
+                return True
+    return False
+
+
+def parse_date_evidence(value):
+    text = str(value or "").strip()
+    iso = re.search(r"\b(20\d\d)-(\d{2})-(\d{2})\b", text)
+    if iso:
+        year, month, day = map(int, iso.groups())
+    else:
+        match = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)(?:[ ,]+(20\d\d))?", text, re.I)
+        if not match:
+            return None
+        months = {m: i + 1 for i, m in enumerate(
+            ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
+        month = months.get(match[2][:3].lower())
+        if not month:
+            return None
+        day, year = int(match[1]), int(match[3]) if match[3] else None
+    try:
+        datetime(year or 2000, month, day)
+    except ValueError:
+        return None
+    return year, month, day
+
+
+def date_evidence(data, field="start_date"):
+    values = data.get("dates") or {}
+    result = parse_date_evidence(values.get(field)) if isinstance(values, dict) else None
+    if not result and field == "start_date":
+        result = parse_date_evidence(data.get("overall_schedule_text"))
+    return result
+
+
+def dates_conflict(left, right):
+    for field in ("start_date", "end_date"):
+        a, b = date_evidence(left, field), date_evidence(right, field)
+        if a and b and (a[1:] != b[1:] or (a[0] and b[0] and a[0] != b[0])):
+            return True
+    return False
+
+
+def locations_conflict(left, right):
+    a, b = (set(norm_text(d.get("location")).replace("gurgaon", "gurugram").split())
+            for d in (left, right))
+    # A city-only poster can complement a full address, but two different venues
+    # are not automatically treated as the same event.
+    return bool(a and b and not (a <= b or b <= a))
+
+
+def event_urls(data):
+    result = set()
+    for value in data.get("registration_urls") or []:
+        parsed = urlsplit(value if "://" in value else "https://" + value)
+        if parsed.hostname and parsed.path.strip("/"):
+            # A site homepage alone is not tournament identity evidence.
+            result.add((parsed.hostname.lower(), parsed.path.rstrip("/"), parsed.query))
+    return result
+
+
+def compatible(left, right):
+    return not dates_conflict(left, right) and not locations_conflict(left, right)
+
+
+def match_evidence(left, right):
+    if not compatible(left, right) or not titles_match(left, right):
+        return False
+    if event_urls(left) & event_urls(right):
+        return True
+    a, b = date_evidence(left), date_evidence(right)
+    return bool(a and b and a[1:] == b[1:])
+
+
+def richness(source):
+    d = source["data"]
+    return (len(d.get("events") or []), len(d.get("organizer_contacts") or []),
+            bool(d.get("location")), bool(d.get("registration_urls")),
+            len(json.dumps(d, default=str)))
+
+
+def group_sources(sources):
+    """Known-year sources establish editions before yearless posters are matched."""
+    anchored, partial = [], []
+    for source in sorted(sources, key=lambda s: s["id"]):
+        d = date_evidence(source["data"])
+        (anchored if d and d[0] else partial).append(source)
+    groups, review = [], {}
+    for phase in (anchored, partial):
+        for source in phase:
+            candidates = [g for g in groups
+                if all(compatible(source["data"], s["data"]) for s in g)
+                and any(match_evidence(source["data"], s["data"]) for s in g)]
+            if len(candidates) == 1:
+                candidates[0].append(source)
+            else:
+                groups.append([source])
+                if len(candidates) > 1:
+                    review[source["id"]] = "Matches more than one edition; kept separate for review"
+                elif not date_evidence(source["data"]):
+                    review[source["id"]] = "No usable date evidence; kept separate unless a unique event URL matched"
+    return groups, review
+
+
+def unique_values(values):
+    seen, output = set(), []
+    for value in values:
+        key = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+        if value not in (None, "", [], {}) and key not in seen:
+            seen.add(key)
+            output.append(value)
+    return output
+
+
+def canonical_payload(group, review):
+    ordered = sorted(group, key=lambda s: s["id"])
+    ordered.sort(key=richness, reverse=True)
+    data, provenance, conflicts = {}, {}, []
+    for field in SCHEMA["properties"]:
+        if field == "dates":
+            data[field] = {}
+            for subfield in SCHEMA["properties"]["dates"]["properties"]:
+                choices = [(s["id"], (s["data"].get("dates") or {}).get(subfield)) for s in ordered]
+                values = unique_values(v for _, v in choices)
+                data[field][subfield] = values[0] if values else None
+                provenance[field + "." + subfield] = [sid for sid, v in choices if v == data[field][subfield] and v]
+                if len(values) > 1:
+                    conflicts.append({"field": field + "." + subfield, "source_record_ids": [sid for sid, v in choices if v]})
+            continue
+        choices = [(s["id"], s["data"].get(field)) for s in ordered]
+        if field == "overall_schedule_text":
+            # A poster's explicit hours are more useful than a generic schedule description.
+            choices.sort(key=lambda pair: bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*[ap]m\b", str(pair[1]), re.I)), reverse=True)
+        values = unique_values(v for _, v in choices)
+        if field in ("other_titles", "registration_urls", "ambiguities"):
+            data[field] = unique_values(v for _, items in choices for v in (items or []))
+            provenance[field] = [sid for sid, value in choices if value]
+        else:
+            # Keep the most complete source's field; preserve differing source values
+            # through references, rather than silently inventing a merged value.
+            default = [] if SCHEMA["properties"][field]["type"] == "ARRAY" else None
+            data[field] = values[0] if values else default
+            provenance[field] = [sid for sid, value in choices if value == data[field] and value]
+            if len(values) > 1:
+                conflicts.append({"field": field, "source_record_ids": [sid for sid, value in choices if value]})
+    data["other_titles"] = unique_values(data["other_titles"] + [s["data"].get("tournament_name") for s in ordered])
+    source_ids = sorted(s["id"] for s in ordered)
+    file_ids = sorted({file_id for s in ordered for file_id in s.get("file_ids", [])})
+    value = {
+        "data": data, "source_record_ids": source_ids, "source_file_ids": file_ids,
+        "primary_source_record_id": ordered[0]["id"], "field_sources": provenance,
+        "field_variants": conflicts,
+        "matching_notes": [review[sid] for sid in source_ids if sid in review],
+        "status": "active", "superseded_by": [],
+        "review_status": "needs_review" if conflicts or any(sid in review for sid in source_ids) or data["ambiguities"] else "unreviewed",
+    }
+    digest = hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    value["_notabot_grouping"] = {"version": GROUPING_VERSION, "fingerprint": digest}
+    return value
+
+
+def build_canonical_plan(sources, existing):
+    groups, review = group_sources(sources)
+    managed = {key: value for key, value in existing.items() if value.get("_notabot_grouping")}
+    used, desired = set(), {}
+    for group in groups:
+        payload = canonical_payload(group, review)
+        candidates = sorted(key for key, old in managed.items() if key not in used
+            and (set(old.get("source_record_ids", [])) & set(payload["source_record_ids"])
+                 or set(old.get("source_file_ids", [])) & set(payload["source_file_ids"])))
+        key = candidates[0] if candidates else "nt_" + hashlib.sha256(payload["source_record_ids"][0].encode()).hexdigest()[:24]
+        if key in used:
+            key = "nt_" + hashlib.sha256("|".join(payload["source_record_ids"]).encode()).hexdigest()[:24]
+        if key in used or (key in existing and key not in managed):
+            raise RuntimeError("Canonical ID collision; no source or canonical records changed")
+        used.add(key)
+        desired[key] = payload
+    writes = {}
+    for key, payload in desired.items():
+        if existing.get(key, {}).get("_notabot_grouping") != payload["_notabot_grouping"] or existing.get(key, {}).get("status") != "active":
+            writes[key] = payload
+    for key, old in managed.items():
+        if key in used:
+            continue
+        targets = sorted(k for k, p in desired.items()
+            if set(old.get("source_record_ids", [])) & set(p["source_record_ids"])
+            or set(old.get("source_file_ids", [])) & set(p["source_file_ids"]))
+        if old.get("status") != "superseded" or old.get("superseded_by") != targets:
+            writes[key] = {"status": "superseded", "superseded_by": targets}
+    return writes, len(groups)
+
+
+def read_grouping_collection(db, name):
+    values = list(db.collection(name).limit(MAX_GROUPING_RECORDS + 1).stream())
+    if len(values) > MAX_GROUPING_RECORDS:
+        raise RuntimeError("Grouping scan limit reached in " + name + "; no grouping writes performed")
+    return {doc.id: doc.to_dict() for doc in values}
+
+
+def refresh_canonical_tournaments(store):
+    """Run under the collector lease. Source collections are strictly read-only here."""
+    records = read_grouping_collection(store.db, "tournaments")
+    markers = read_grouping_collection(store.db, "processed_files")
+    existing = read_grouping_collection(store.db, CANONICAL_COLLECTION)
+    active = {}
+    for file_id, marker in markers.items():
+        if marker.get("tournament_id"):
+            active.setdefault(marker["tournament_id"], []).append(file_id)
+    # A dangling source pointer must not silently cause a derived record to vanish.
+    if set(active) - set(records):
+        raise RuntimeError("Processed-file pointer has no tournament record; grouping left unchanged")
+    sources = []
+    for key, value in records.items():
+        meta = value.get("_notabot") or {}
+        if meta and key not in active:
+            continue  # Historical extraction revision; current source markers take precedence.
+        if not value.get("tournament_name"):
+            continue
+        sources.append({"id": key, "data": {k: v for k, v in value.items() if k != "_notabot"},
+                        "file_ids": active.get(key) or ([meta["source_file_id"]] if meta.get("source_file_id") else [])})
+    writes, count = build_canonical_plan(sources, existing)
+    if len(writes) > MAX_GROUPING_WRITES:
+        raise RuntimeError("Grouping write limit reached; no grouping writes performed")
+    if writes:
+        @firestore.transactional
+        def save(transaction):
+            store.require_owner(transaction)
+            for key, payload in writes.items():
+                if len(json.dumps(payload, default=str).encode()) > 700000:
+                    raise ValueError("Canonical record too large; grouping transaction aborted")
+                transaction.set(store.db.collection(CANONICAL_COLLECTION).document(key),
+                    dict(payload, updated_at=firestore.SERVER_TIMESTAMP), merge=True)
+            transaction.set(store.lock, store.lease_data())
+        save(store.db.transaction())
+    print("Tournament grouping: " + json.dumps({"source_records": len(sources),
+        "active_tournaments": count, "canonical_writes": len(writes), "gemini_requests": 0}))
 
 
 def main():
