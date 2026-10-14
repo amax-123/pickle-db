@@ -66,7 +66,9 @@ jobs:
           
           SCHEMA = obj({
               "tournament_name": string(),
+              "other_titles": arr({"type": "STRING"}),
               "dates": obj({"start_date": string(), "end_date": string(), "registration_deadline": string()}),
+              "overall_schedule_text": string(),
               "location": string(),
               "registration_urls": arr({"type": "STRING"}),
               "prize_pool_text": string(),
@@ -90,6 +92,12 @@ jobs:
           Report contradictory schedules and missing category definitions in ambiguities.
           Preserve registration URLs only when readable; do not invent a URL from an unreadable QR code.
           Output only JSON matching the supplied schema. Extract independently; do not merge sources.
+          Use the explicit branded event name as tournament_name when present. Preserve other printed
+          titles, subtitles and promotional headings in other_titles; do not use the filename as evidence.
+          Capture event-wide dates and opening/closing hours in overall_schedule_text, even if there
+          are no event categories. Preserve partial dates verbatim there when the year is missing;
+          leave ISO date fields null rather than inventing a year. Do not discard times just because
+          they cannot be attached to a category. Report meaningful eligibility boundary gaps as ambiguities.
           """
           
           def validate(value, schema, path="root"):
@@ -193,7 +201,7 @@ jobs:
                   json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"]),
                   scopes=["https://www.googleapis.com/auth/drive.readonly"])
               session = AuthorizedSession(credentials)
-              summary = {"model": MODEL, "max_extraction_requests": 5, "firestore_writes": 0,
+              summary = {"model": MODEL, "trial_schema_version": 2, "max_extraction_requests": 5, "firestore_writes": 0,
                   "sources": [], "review": "Compare paired doc/poster results manually; this trial does not merge or deduplicate records."}
               failed = False
               for index, (file_id, label) in enumerate(SOURCES):
