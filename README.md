@@ -1,122 +1,188 @@
 # Notabot — Tournament Collector
 
-Notabot extracts tournament information from documents and stores it in Firebase Firestore. This repository currently contains a scheduled Python collector for PDFs in one Google Drive folder.
+Notabot collects tournament documents from Google Drive, extracts structured information using Gemini, and groups related source records into tournaments in Firebase Firestore.
 
-## Names and components
+The current application is a scheduled Python script. WhatsApp collection, a public API and a user interface are not implemented in this repository.
+
+## Components
 
 | Component | Name / identifier |
 | --- | --- |
 | Application | Notabot |
 | GitHub repository | `amax-123/pickle-db` |
-| Gemini project | Notabot (project number `625770699910`) |
+| Gemini project | Notabot — project number `625770699910` |
+| Firebase display name | Notabot — Pickleball DB |
 | Firebase project ID | `pickleball-db` |
-| Intended Firebase display name | Notabot — Pickleball DB (rename pending) |
-| Current GitHub Actions workflow | Pickleball Data Sync |
+| Production workflow | Pickleball Data Sync |
+| Extraction model | `gemini-3.5-flash-lite` |
 
-Project IDs, repository name and collection names are unchanged. Display names help identify components; they do not connect services. Credentials and environment variables determine those connections.
+Display names are labels. Project IDs, credentials and environment variables determine which services the script uses.
 
-## Current workflow
+## Workflow
 
 ```mermaid
 flowchart TD
-    A["Scheduled or manual GitHub Actions run"] --> B["List PDFs in configured Drive folder"]
-    B --> C{"File ID in processed_files?"}
-    C -- Yes --> D["Skip file"]
-    C -- No --> E["Download PDF and extract text with PyPDF2"]
-    E --> F["Gemini returns tournament JSON"]
-    F --> G["Parse JSON and add tournaments document"]
-    G --> H["Mark Drive file ID as processed"]
+    A["Scheduled or manual run"] --> B["List supported files in Drive folder"]
+    B --> C{"Unchanged or legacy file?"}
+    C -- Yes --> D["Preserve existing record"]
+    C -- No --> E["Download and hash content"]
+    E --> F{"Identical extraction already saved?"}
+    F -- Yes --> G["Link file to saved extraction"]
+    F -- No --> H["Check request limits and call Gemini"]
+    H --> I["Validate schema and save atomically"]
+    D --> J["Group current sources into tournaments"]
+    G --> J
+    I --> J
+    J --> K["Save canonical records and source references"]
 ```
 
-1. GitHub Actions installs the pinned dependencies and runs `main.py` using Python 3.9.
-2. The script lists PDFs directly inside the configured Drive folder.
-3. Previously processed Drive file IDs are skipped.
-4. PyPDF2 extracts text locally. **Only that text is sent to Gemini**, not PDF images or the original PDF.
-5. Gemini is asked for tournament name, dates, location, event categories, entry fees, prize money and organiser contacts.
-6. The returned JSON is saved in Firestore, then the source file is marked as processed.
+The script uses a Firestore lease to prevent overlapping collector runs. It paginates the configured folder's direct children; subfolders are not traversed.
 
-The model currently configured in `main.py` is `gemini-3.8-flash`. Model availability and project quotas must be checked separately.
-
-## Files
-
-| File | Purpose |
+| Source type | Input sent to Gemini |
 | --- | --- |
-| `main.py` | Drive download, text extraction, Gemini request and Firestore writes |
-| `requirements.txt` | Pinned Python dependencies |
-| `.github/workflows/daily_sync.yml` | Scheduled and manual execution |
+| PDF | Original PDF bytes, including visual content |
+| JPEG / PNG | Original image bytes |
+| Google Doc | Exported plain text |
 
-## Setup
+Google Docs' embedded images are not extracted separately. Standalone text files, arbitrary URLs, other image formats and WhatsApp messages are not currently supported.
 
-Use a Firebase project with a Firestore database, a service account allowed to write to it, and a Gemini API key.
+## Extraction and schema
 
-- Enable the Google Drive API in the service account's Google Cloud project.
-- Share the source Drive folder with the service account email as **Viewer**.
-- Create the following GitHub repository secrets under **Settings → Secrets and variables → Actions**.
+The model receives the tested prompt and a structured response schema. Python then checks required fields, value types and nonnegative finite amounts before saving.
+
+The schema includes:
+
+- Tournament name, other printed titles, dates and overall schedule text.
+- Location, registration URLs and prize-pool wording.
+- Events with sport, category, entry fee, currency, fee basis, winner/runner-up amounts, schedule and eligibility.
+- Organiser contacts, rules and ambiguities.
+
+Missing facts remain null or empty lists. Partial dates can be retained as schedule text without inventing a year. Schema validation does not establish factual accuracy or validate all date/URL semantics.
+
+New extraction records contain `_notabot` metadata: source ID, name, URL, version, MIME type, content hash, model, schema version, token usage and review status. Content hashes include the input MIME type; reuse also depends on the model and schema version.
+
+## Firestore collections
+
+| Collection | Purpose |
+| --- | --- |
+| `tournaments` | Original legacy records and immutable new source-extraction snapshots |
+| `processed_files` | Drive file IDs mapped to their current extraction records and versions |
+| `canonical_tournaments` | Derived tournament groups linking their source records |
+| `notabot_control` | Collector lease and daily Gemini-attempt counter |
+
+**To view grouped results:** Firebase Console → Firestore Database → Data → `canonical_tournaments`.
+
+Within a canonical document:
+
+- `data` contains the selected tournament details.
+- `source_record_ids` links to documents in `tournaments`.
+- `source_file_ids` contains available Drive file IDs.
+- `field_sources` identifies the supporting extraction records.
+- `field_variants` records fields whose source values differ, with references for review.
+- `matching_notes`, `review_status` and `status` describe the group.
+
+Use records with `status = active`. Older derived groups can be marked `superseded`; they are not deleted. Source extraction records are never deleted by grouping.
+
+### How grouping works
+
+Grouping uses code, **not additional Gemini calls**. It compares normalised titles with dates and locations, or a shared event-specific registration URL. A registration site's homepage alone is insufficient.
+
+Known-year records establish editions first. A yearless poster can join a uniquely matching group; ambiguous matches across editions remain separate. Explicitly conflicting dates or venues prevent automatic grouping.
+
+The most complete source generally supplies each displayed field, with other sources filling missing fields. Explicit playing hours take priority over generic schedule descriptions. Titles, registration URLs and ambiguity lists are combined. Other differing values are referenced for review rather than silently reconciled; this is not a comprehensive event-by-event merge.
+
+Canonical fields are generated by the script and can change when sources change. They are not a manual-editing interface. Unrelated top-level fields are retained, but editing generated fields is not a supported correction workflow yet.
+
+## Preservation and repeat runs
+
+- Old `processed_files` markers without a schema version are skipped unchanged. Their legacy tournament records are not automatically re-extracted or migrated.
+- New unchanged files are skipped without a Gemini request.
+- Identical content already extracted by this version reuses the saved snapshot.
+- A changed new-format file can create a new snapshot; the previous snapshot remains intact. Grouping uses the current processed-file pointers.
+- Extraction and processed-file writes are atomic. Canonical grouping is a separate transaction and can be retried independently.
+- A failed request is not marked processed. A later run can retry it while skipping previously saved files.
+
+Hash-based reuse applies to new-format snapshots. Legacy records lack hashes, so re-uploading an old document under a new Drive ID may still require extraction. Different encodings of equivalent content can also have different hashes.
+
+## Setup and secrets
+
+Use a Firebase project with Firestore and a service account permitted to write to it. Enable the Google Drive API in the service account's project and share the source folder with that account's email as **Viewer**.
+
+Set these GitHub repository secrets under **Settings → Secrets and variables → Actions**:
 
 | Secret | Value |
 | --- | --- |
-| `FIREBASE_SERVICE_ACCOUNT_KEY` | Complete service-account JSON, including its private key |
+| `FIREBASE_SERVICE_ACCOUNT_KEY` | Complete service-account JSON |
 | `GEMINI_API_KEY` | Gemini API key |
-| `DRIVE_FOLDER_ID` | Folder ID from the Drive URL, not the full URL |
+| `DRIVE_FOLDER_ID` | Folder ID only, not the full URL |
 
-The same service-account JSON authenticates Firestore and read-only Drive access. The Gemini key can belong to a separate Google Cloud project.
+The service account authenticates Firestore and read-only Drive access. The Gemini key belongs to a separate project. Never commit credential values. GitHub does not reveal a saved secret's value when editing it.
 
-Never commit credentials, API keys or private-key JSON files. GitHub does not display a secret's saved value when editing it.
+Existing `requirements.txt` and repository secrets remain in use. Runtime optimisation and dependency cleanup have been deferred.
 
 ## Running and checking results
 
-Open **Actions → Pickleball Data Sync → Run workflow** and select the default branch.
+Open **Actions → Pickleball Data Sync → Run workflow → main** to start a new run with the latest code. Re-running an older run uses its original commit.
 
-The configured cron is `0 */6 * * *`: 00:00, 06:00, 12:00 and 18:00 UTC, equivalent to 05:30, 11:30, 17:30 and 23:30 India time. Actual scheduled start times can vary.
+The cron is `0 */6 * * *`: 00:00, 06:00, 12:00 and 18:00 UTC, equivalent to **05:30, 11:30, 17:30 and 23:30 India time**. Scheduled start times can vary.
 
-Inspect the **Install dependencies** and **Run Extraction Script** logs. View extracted records in Firebase Console → Firestore Database → Data → `tournaments`.
+The logs show source IDs saved/skipped, extraction counts and grouping counts. Extracted contact details and credentials are not intentionally printed.
 
-A green run is not proof every file succeeded: some parsing and database errors are caught and printed without failing the job.
+- API, transport and database failures stop processing without automatic AI retries or a paid fallback.
+- Invalid/oversized files are reported while later files can continue.
+- Encountered processing errors fail the workflow; successful earlier writes remain saved.
+- Reaching a request/download cap leaves remaining files pending without itself failing the run. A green run therefore does not prove the entire backlog was processed.
+- The existing 15-second pauses between extraction requests remain in place.
 
-## Firestore records and schema
+## Limits and cost controls
 
-| Collection | Document ID | Contents |
-| --- | --- | --- |
-| `tournaments` | Firestore-generated ID | JSON fields returned by Gemini |
-| `processed_files` | Drive file ID | `file_name` and `processed_at` |
+As confirmed by the owner on **15 October 2026**, Firebase is on **Spark** and the Notabot Gemini project is on **Free tier**, with project billing disabled.
 
-The prompt requests a structure, but the script does **not** enforce a fixed schema. JSON mode requests valid JSON; `json.loads` checks JSON syntax. Neither verifies field names, data types, dates, amounts or factual accuracy. Firestore stores the supplied fields without enforcing an application schema.
+The owner's AI Studio quota sheet listed Flash Lite at 15 requests/minute, 250,000 tokens/minute and 500 requests/day. These are recorded setup observations, not guaranteed future quotas; check AI Studio for current limits.
 
-The processed-file check prevents repeat processing of the same Drive ID. It does **not** deduplicate tournaments across different files.
+| Script control | Current value |
+| --- | ---: |
+| Gemini attempts per run | 25 |
+| Collector Gemini attempts per day | 200 |
+| Maximum source size | 12 MiB |
+| Maximum output tokens per extraction | 16,000 |
+| File downloads per run | 100 |
+| Supported files scanned per run | 1,000 |
+| Records read per collection for grouping | 2,000 |
+| Canonical writes per grouping pass | 400 |
 
-## Current limitations
+Daily attempts are reserved in Firestore before the API request, including failures. The counter resets by the Pacific calendar date. It measures this collector only: trial workflows and other applications do not share that counter.
 
-- PDFs only; Google Docs, standalone images, WhatsApp messages and links are not ingested.
-- No OCR: scanned PDFs and image-only content can be missed. A page returning no extracted text can cause an error.
-- Only direct folder children are queried, with no pagination or subfolder traversal.
-- Changed contents under an already processed Drive ID are skipped.
-- Different files describing the same tournament can create duplicate records.
-- Tournament and processed-file writes are separate, so a partial failure can cause duplicate processing.
-- No source link is stored on the tournament record.
-- No enforced schema, conflict review, request/token cap, cost tracking or application-level retry policy.
-- Download and Gemini errors can stop the run; errors inside the save block are labelled as JSON parsing errors even when caused by database writes.
-- No continuous WhatsApp collector is present in this repository. Any earlier external bot needs to be located and verified separately.
+Grouping scans are bounded and must be revisited as the archive grows. File-scan/grouping limits raise actionable errors rather than silently processing an incomplete grouping dataset.
 
-## Cost status
+The script does not enforce a project-wide token quota or monetary budget. Keep the confirmed free plans if zero spend is required; request caps do not prevent charges if billing is enabled later. Firestore reads/writes still occur during skip and grouping checks.
 
-As reported by the owner during setup:
+## Verified checkpoint
 
-- Firebase is on **Spark**.
-- The Notabot Gemini project shows **Tier 1 · Prepay**, a paid tier.
+The production run [38630516178](https://github.com/amax-123/pickle-db/actions/runs/38630516178) succeeded with:
 
-The current script does not guarantee zero cost or enforce a spending limit. Existing processed-file checks avoid repeat Gemini calls for the same Drive ID, but new files can incur Gemini usage charges. Free-tier eligibility, quotas and any billing changes still need to be confirmed.
+- Five source records grouped into three active tournaments.
+- Three canonical records written.
+- Five input files skipped during extraction.
+- Zero Gemini requests and zero processing errors.
 
-## Planned direction — not implemented
+The owner confirmed the three documents were visible in Firestore. This verifies the current sample workflow, not extraction accuracy for every future document.
 
-Keep future responsibilities identifiable without building separate services yet:
+## Repository files
 
-| Responsibility | Proposed label |
+| File | Purpose |
 | --- | --- |
-| Source collection from Drive and eventually WhatsApp | Notabot Collect |
-| Extraction, validation and tournament deduplication | Notabot Extract |
-| API and user interface | Notabot API |
+| `main.py` | Production collection, validation, storage and grouping |
+| `requirements.txt` | Existing pinned dependencies |
+| `.github/workflows/daily_sync.yml` | Scheduled/manual production workflow |
+| `.github/workflows/notabot_flash_lite_test.yml` | Manual five-source extraction trial; no Firestore writes |
 
-Future improvements should include version-aware processing, content-hash reuse, image/Google Docs support, validated schemas, provenance, conflict review, and bounded requests/retries. Usage records can attribute work to each component using source IDs, model names, token counts and processing outcomes.
+The trial performs up to five extraction requests and uploads JSON results as a GitHub Actions artifact retained for three days. It deliberately reprocesses its fixed sample files and is not part of the production daily-attempt counter.
 
-These are planning labels only. This README does not introduce services, change billing, rename cloud resources or modify the existing Python/Firebase behaviour.
+## Future scope — not implemented
 
+- **Notabot Collect:** WhatsApp collection, including own messages, and additional source types.
+- **Notabot Extract:** review/correction workflows, richer conflict resolution, safe legacy migration and broader validation samples.
+- **Notabot API:** API, user interface and separately attributable service usage.
+
+These are responsibility labels, not deployed services. The current application does not require model training, a vector database or an always-on server for Drive ingestion. Continuous WhatsApp hosting remains a separate decision.
