@@ -17,7 +17,7 @@ DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID") # The ID part of your Drive 
 
 # Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash')
+model = genai.GenerativeModel('gemini-3.8-flash')
 
 # Initialize Firebase
 cred = credentials.Certificate(FIREBASE_CREDENTIALS)
